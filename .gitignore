@@ -1,0 +1,67 @@
+# ---------------------------------------------------------------
+# Apache Camel learning workspace (camel-microservice-a / -b)
+# ---------------------------------------------------------------
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Icon?
+
+# IntelliJ IDEA / other JetBrains IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# VS Code / Eclipse / NetBeans
+.vscode/
+*.code-workspace
+.classpath
+.project
+.settings/
+.factorypath
+.apt_generated
+.springBeans
+.sts4-cache
+nbproject/private/
+nbbuild/
+nbdist/
+.nb-gradle/
+
+# Maven
+target/
+build/
+!.mvn/wrapper/maven-wrapper.jar
+.mvn/timing.properties
+
+# Logs and crash dumps
+*.log
+logs/
+hs_err_pid*
+replay_pid*
+
+# Java compiled output
+*.class
+
+# Local environment / secrets
+.env
+.env.local
+*.local
+application-local.properties
+application-local.yml
+application-local.yaml
+
+# --- Camel runtime / generated files ---------------------------------
+# Camel keeps an archive of consumed files in a .camel directory
+**/.camel/
+
+# Files produced by the file routes (keep the folders themselves)
+**/files/output/*
+!**/files/output/.gitkeep
+**/files/input/*.processed
+
+# Spring Boot devtools restart trigger
+.spring-boot-devtools/
