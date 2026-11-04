@@ -21,6 +21,7 @@ public class FirstTImerRoute extends RouteBuilder {
     public void configure() throws Exception {
         from("timer:first-timer") // Route definition - from where the input if coming from - and Its Name
               // .transform().constant("My Constant Message") // Basic Transformation
+                .routeId("The first route") // giving custom names to the route
                 .bean(getCurrentTimeBean, "getCurrentTime") // as per the camel bean naming
                 // Processing vs Transformation
                 // Processing - No Change in Body | Transformation - Change in Body
