@@ -23,6 +23,13 @@ services:
       - KAFKA_NUM_PARTITIONS=1
       - CLUSTER_ID=5L6g3nShT-eMCtK--X86sw
 
+  activemq:
+    image: 'rmohr/activemq'
+    platform: linux/amd64
+    ports:
+      - "61616:61616"
+      - "8161:8161"
+
 volumes:
   kafka_data:
     driver: local
