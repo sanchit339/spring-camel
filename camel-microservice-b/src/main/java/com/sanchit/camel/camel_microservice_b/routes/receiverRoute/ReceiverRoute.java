@@ -21,6 +21,17 @@ public class ReceiverRoute extends RouteBuilder {
                 .bean(customCurrencyProcessor)
                 .to("log:my-custom-log-for-received-msg");
 
+        from("activemq:csv-processor")
+                // Camel maps the JMS message to a Java body. Capture the actual
+                // runtime type before logging so we can see what arrived.
+                .process(exchange -> {
+                    Object body = exchange.getIn().getBody();
+                    String bodyType = body == null ? "null" : body.getClass().getName();
+                    exchange.getIn().setHeader("BodyType", bodyType);
+                })
+                .log("Received from csv-processor -> type: ${header.BodyType}, body: ${body}")
+                .to("log:received-message from active mq");
+
     }
 }
 
