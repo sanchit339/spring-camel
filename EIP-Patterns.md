@@ -11,6 +11,8 @@ Patterns covered so far:
 - Splitter — `CsvSplitter.java`
 - Aggregator — `AggregatorPattern.java`
 - Routing Slip — `RoutingSlip.java`
+- Dynamic Router — `DynamicRoutePattern.java`
+- Configuration from `application.properties` & logging — `ConfigExample.java` (see below)
 - `direct:` component — linking routes (see below)
 - DSL note: `method(...)` vs `.bean(...)` (see below)
 
@@ -505,23 +507,23 @@ back.
 
 ```java
 // The slip: endpoints are visited in this order.
-private static final String SLIP = "direct:validate,direct:transform,direct:send";
+private static final String SLIP = "direct:slip-validate,direct:slip-transform,direct:slip-send";
 
-from("timer:msgSender?period=1000")
+from("timer:msgSender?period=1000&includeMetadata=true")
         .routeId("slip-route")
-        .setBody(simple("message-${header.CamelTimerCounter}"))
+        .setBody(simple("message-${exchangeProperty.CamelTimerCounter}"))
         // Put the slip in a header. routingSlip reads it once, before routing starts.
         .setHeader("mySlip", constant(SLIP))
         .routingSlip(header("mySlip"));
 
-from("direct:validate")
+from("direct:slip-validate")
         .log("1. validate: ${body}");
 
-from("direct:transform")
+from("direct:slip-transform")
         .setBody(simple("${body} -> transformed"))
         .log("2. transform: ${body}");
 
-from("direct:send")
+from("direct:slip-send")
         .log("3. send: ${body}")
         .to("log:dummyMsgSend");
 ```
@@ -578,7 +580,7 @@ public List<String> buildSlip(CurrencyExchange body) {
 ### Common mistake
 
 ```java
-String slip = "direct:validate,direct:transform,direct:send";
+String slip = "direct:slip-validate,direct:slip-transform,direct:slip-send";
 .routingSlip(simple("slip"));   // WRONG: literal endpoint name "slip"
 ```
 
@@ -590,6 +592,223 @@ variable as a constant, or put it in a header and read the header:
 .setHeader("mySlip", constant(slip))
 .routingSlip(header("mySlip"));            // via header (shown above)
 ```
+
+## Dynamic Router EIP
+
+Example: `DynamicRoutePattern.java`.
+
+The Dynamic Router is a **Routing Slip that is recomputed after every hop**.
+Camel asks an Expression (usually a bean method) for the next endpoint, routes
+there, then asks again. Returning `null` ends the routing.
+
+### Intuitive example
+
+| EIP | Analogy |
+| --- | --- |
+| Routing Slip | A fixed itinerary: `warehouse -> bank -> office` |
+| Dynamic Router | A GPS: after each stop it decides the next one, and may change route or loop |
+
+### Why you need it
+
+Use it when the next step is **not known up front** and depends on:
+
+- the current message (e.g. amount > 50 goes to audit),
+- the result of the previous step (success -> send, failure -> retry),
+- external state (database, rules engine, tenant config),
+- a workflow/state machine that can branch or loop.
+
+Without it you end up with deeply nested `choice()` blocks and duplicated logic.
+With it, one bean owns the decision and the route stays small.
+
+### The example route
+
+```java
+// Trigger with alternating normal/high-value messages.
+from("timer:dynamicRouterTrigger?period=5000&includeMetadata=true")
+        .routeId("dynamic-router-trigger")
+        .process(exchange -> {
+            // CamelTimerCounter is an EXCHANGE PROPERTY, not a message header:
+            // it is the tick number (1, 2, 3, ...), one per timer period.
+            Long counter = exchange.getProperty(Exchange.TIMER_COUNTER, Long.class);
+            BigDecimal multiple = counter % 2 == 0
+                    ? BigDecimal.valueOf(10)
+                    : BigDecimal.valueOf(60);
+            exchange.getIn().setBody(new CurrencyExchange(counter, "USD", "INR", multiple));
+        })
+        .to("direct:start");
+
+from("direct:start")
+        .routeId("dynamic-router-route")
+        .dynamicRouter(method(dynamicRouterBean, "next"));
+
+from("direct:validate")
+        .log("1. Validate ${body}");
+
+from("direct:audit")
+        .log("2a. audit (High Value) : ${body}");
+
+from("direct:enrich")
+        .log("2b. enrich (normal) : ${body}");
+
+from("direct:send")
+        .log("3. Send ${body}");
+```
+
+```java
+@Component
+class DynamicRouterBean {
+    public String next(CurrencyExchange body,
+                       @ExchangeProperties Map<String, Object> properties) {
+        // State lives on the Exchange, not in a bean field.
+        Object current = properties.get("dynamicRouter.step");
+        int step = current == null ? 0 : (Integer) current;
+        properties.put("dynamicRouter.step", step + 1);
+
+        return switch (step) {
+            case 0 -> "direct:validate";
+            case 1 -> body.getConversionMultiple().compareTo(new BigDecimal("50")) > 0
+                    ? "direct:audit"
+                    : "direct:enrich";
+            case 2 -> "direct:send";
+            default -> null; // no more hops -> routing ends
+        };
+    }
+}
+```
+
+### Walkthrough
+
+```text
+conversionMultiple = 10 -> validate -> enrich -> send -> null (done)
+conversionMultiple = 60 -> validate -> audit  -> send -> null (done)
+```
+
+The bean is called **once before each hop**, and the final call returns `null`
+to stop. Each timer tick starts a new exchange, so the step counter starts at 0
+again.
+
+### Dynamic Router vs related EIPs
+
+| EIP | When destinations are decided | Flow | When it stops |
+| --- | --- | --- | --- |
+| `recipientList` | once, by an expression | fan-out to all | after all recipients |
+| `routingSlip` | once, before routing | sequential chain | when the slip is empty |
+| `dynamicRouter` | **after every step** | sequential chain | when the bean returns `null` |
+| `pipeline` | design time | sequential chain | when steps end |
+
+### Gotchas
+
+- **Always return `null` to stop**, otherwise the router loops forever.
+- Store state on **exchange properties**, not bean fields. The bean is a singleton
+  shared by concurrent messages; a field would mix up messages.
+- Keep the method a **decision function**; do the real work in the target
+  endpoints.
+- A hop can return multiple endpoints (`"direct:a,direct:b"`); they run in order
+  before the router is asked again.
+- `.ignoreInvalidEndpoints()` logs and skips a bad URI instead of failing.
+- Destinations are strings, so you lose the static route diagram and some
+  compile-time safety. Use it only where the flexibility is needed.
+- `CamelSlipEndpoint` / `Exchange.SLIP_ENDPOINT` shows the current endpoint.
+- Camel also offers an `@DynamicRouter` annotation on a bean method as an
+  alternative to calling `.dynamicRouter(method(...))` in the route.
+
+## Bean parameter binding: `@ExchangeProperties`
+
+`@ExchangeProperties` injects the **Exchange's property map** into a bean method:
+
+```java
+public String next(CurrencyExchange body,
+                   @ExchangeProperties Map<String, Object> properties) {
+    Object value = properties.get("myKey");
+    properties.put("myKey", value);
+    return "direct:next";
+}
+```
+
+Exchange **properties** are a per-exchange scratchpad. They are not the message
+body and not message headers.
+
+| Annotation | Injects | Where it lives | Sent over JMS/HTTP? |
+| --- | --- | --- | --- |
+| `@Body` | message body | message | yes (the body) |
+| `@Header("x")` | one header | message | yes |
+| `@Headers` | all headers | message | yes |
+| `@ExchangeProperty("x")` | one property | exchange | **no** |
+| `@ExchangeProperties` | all properties | exchange | **no** |
+
+### Headers vs properties
+
+| | Headers | Exchange properties |
+| --- | --- | --- |
+| Purpose | message metadata / protocol data | exchange-local state and Camel internals |
+| Travels with the message | yes | only inside the same exchange |
+| Survives JMS/HTTP | yes (mapped/serialized) | **no** |
+| Typical examples | `CamelFileName`, `CamelTimerFiredTime`, `Content-Type` | `CamelTimerCounter`, `CamelAggregatedSize`, `CamelSlipEndpoint`, step counters |
+| Bean annotation | `@Header`, `@Headers` | `@ExchangeProperty`, `@ExchangeProperties` |
+
+### Example: `CamelTimerCounter`
+
+When a `from("timer:...")` endpoint fires, it creates a fresh exchange. **In
+Camel 4.x the timer only adds the values below when `includeMetadata=true`** —
+that option defaults to `false`:
+
+```java
+from("timer:tick?period=5000&includeMetadata=true")
+```
+
+Then, before your route runs, these values are available:
+
+| Name | Where it lives | Type | Meaning |
+| --- | --- | --- | --- |
+| `CamelTimerCounter` | exchange **property** | `Long` | tick number: `1`, `2`, `3`, ... |
+| `CamelTimerName` | exchange **property** | `String` | timer name (`dynamicRouterTrigger`) |
+| `CamelTimerPeriod` | exchange **property** | `Long` | period in ms |
+| `CamelTimerFiredTime` | property **and** header | `Date` | when this tick fired |
+| `CamelMessageTimestamp` | header | `Long` | same instant, in epoch millis |
+
+`CamelTimerCounter` answers "which tick is this?". It is useful for alternating
+behaviour, logging, or building test messages:
+
+```java
+// Java: it is a property, so use getProperty (getHeader returns null!)
+Long counter = exchange.getProperty(Exchange.TIMER_COUNTER, Long.class);
+
+// Simple DSL: same thing
+.setBody(simple("message-${exchangeProperty.CamelTimerCounter}"))
+```
+
+The counter is reset when the route (timer consumer) restarts, and each timer
+endpoint keeps its own counter. It is **not** a message header, so
+`getHeader("CamelTimerCounter", ...)` returns `null` and `${header.CamelTimerCounter}`
+renders empty. If `includeMetadata` is left at its default `false`, the property
+is missing as well (`null`), so `includeMetadata=true` is required.
+
+### Reading and writing without bean binding
+
+```java
+Object value = exchange.getProperty("myKey");
+exchange.setProperty("myKey", value);
+exchange.removeProperty("myKey");
+```
+
+### Where properties help
+
+- **State across repeated calls** — the Dynamic Router step counter.
+- **Passing data between processors** without polluting headers.
+- **Camel's own metadata** — aggregator (`CamelAggregatedSize`,
+  `CamelAggregatedCorrelationKey`, `CamelAggregatedCompletedBy`), routing slip
+  (`CamelSlipEndpoint`), and `CamelToEndpoint`.
+- **Per-message flags** for error handling / retries.
+
+### Gotchas
+
+- Use `Map<String, Object>`, not `Map<String, String>`; property values can be any
+  type. (In `ChoiceBasedRouting.DeciderBean` the maps are typed
+  `Map<String, String>`; prefer `Object` values for safety.)
+- Prefix your own keys (e.g. `myApp.step` or `dynamicRouter.step`) so you don't
+  collide with Camel's `Camel*` properties.
+- Properties are **not** propagated across a JMS or HTTP call. Use headers for
+  data that must cross a broker/network boundary.
 
 ## DSL note: `method(...)` vs `.bean(...)`
 
@@ -708,3 +927,93 @@ If the collection came from a bean instead:
     .bean(rowProcessor, "handleRow")   // runs once per fragment
 .end();
 ```
+
+## Configuration from `application.properties` & logging
+
+Example: `ConfigExample.java` + `camel-microservice-a/src/main/resources/application.properties`.
+
+### Reading properties in a route
+
+```java
+@Component
+public class ConfigExample extends RouteBuilder {
+    @Override
+    public void configure() {
+        from("timer:timer-example?period=5000")
+                .setBody(constant("config example tick"))
+                .to("{{logger-path}}");   // "log:example-log" from properties
+    }
+}
+```
+
+```properties
+logger-path=log:example-log
+```
+
+The important distinction:
+
+| Syntax | Name | When it is evaluated | Used for |
+| --- | --- | --- | --- |
+| `{{logger-path}}` | property placeholder | **once, at startup** | config (URIs, options, names) |
+| `${body}`, `${header.x}` | Simple expression | **every exchange** | message data |
+
+Rules of thumb:
+
+- Configuration → `{{...}}`. Message data → `${...}`.
+- A default is written after a colon: `{{logger-path:log:fallback}}`.
+- If a key has no default and is missing, route startup fails fast.
+- The value comes from Spring's `Environment`, so `application.properties`,
+  environment variables, and command-line arguments all work.
+- Placeholders also work in `from("{{input-endpoint}}")` and component options.
+
+### The `log:` endpoint
+
+`log:example-log` logs the exchange to a logger named `example-log`. It is a
+**producer-only** component, so no `from("log:...")` route is needed. The default
+level is `INFO`; change it per endpoint (`log:example-log?level=DEBUG`) or via
+logging config (`logging.level.example-log=DEBUG`).
+
+### Common property prefixes
+
+| Prefix | Purpose | Example |
+| --- | --- | --- |
+| `camel.component.<name>.<option>` | configure a Camel component | `camel.component.kafka.brokers=localhost:9092` |
+| `camel.main.*` | Camel runtime / standalone options | `camel.main.main-run-controller=true` |
+| `spring.*` | Spring Boot and starter options | `spring.activemq.broker-url=tcp://...` |
+| anything else | your own keys used via `{{...}}` | `logger-path=log:example-log` |
+
+### Standalone vs Spring Boot web
+
+| Setting | What it does | Needed in this project? |
+| --- | --- | --- |
+| `camel.main.main-run-controller=true` | keeps the JVM alive when there is no web server | no — `spring-boot-starter-webmvc`/Tomcat already keeps it alive |
+| `camel.main.duration-max-seconds=60` | stops the Camel context/routes after 60 seconds (a web server may keep the JVM alive) | only for demos/tests |
+
+> **Camel 4 note:** the old `camel.springboot.*` keys (for example
+> `camel.springboot.main-run-controller`) are **not read** by Camel 4.x — use
+> `camel.main.*` instead. The option is also `duration-max-seconds` (plural).
+
+### Logging
+
+```properties
+# Most to least verbose: TRACE < DEBUG < INFO < WARN < ERROR
+logging.level.root=INFO
+
+# Package/class-level loggers: the most specific one wins
+logging.level.org.springframework=INFO
+logging.level.org.apache.camel.spring.boot=INFO
+
+# Camel internals: DEBUG/TRACE is very chatty, use only while debugging
+logging.level.org.apache.camel.impl=DEBUG
+
+# Tune the "log:" component logger name
+logging.level.example-log=DEBUG
+```
+
+- Prefer setting a **package** logger (`org.apache.camel.impl`) over the root
+  logger, so unrelated libraries keep their normal level.
+- Leave `org.apache.camel.impl` at `INFO` day to day; switch to `DEBUG` only to
+  inspect endpoint/consumer internals.
+- The `logging.level.<name>` name can be a package (`org.apache.camel`) or an
+  exact logger name (`example-log`).
+
